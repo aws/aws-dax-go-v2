@@ -37,8 +37,14 @@ type enabledHealthStatus struct {
 
 func newHealthStatus(endpoint string, routeListener RouteListener) HealthStatus {
 	if routeListener != nil && routeListener.isRouteManagerEnabled() {
-		return &enabledHealthStatus{routeListener: routeListener, endpoint: endpoint, lock: sync.RWMutex{}, isHealthy: true}
+		return &enabledHealthStatus{
+			routeListener: routeListener,
+			endpoint:      endpoint,
+			lock:          sync.RWMutex{},
+			isHealthy:     true,
+		}
 	}
+
 	return &disabledHealthStatus{}
 }
 
@@ -58,6 +64,7 @@ func (hs *enabledHealthStatus) onErrorInReadRequest(err error, route DaxAPI) {
 	hs.curReadTimeoutCount += 1
 	if hs.curReadTimeoutCount >= timeoutErrorThreshold {
 		hs.isHealthy = false
+
 		hs.routeListener.removeRoute(hs.endpoint, route)
 	}
 }
@@ -90,6 +97,7 @@ func (hs *enabledHealthStatus) onHealthCheckSuccess(route DaxAPI) {
 	hs.curReadTimeoutCount = 0
 	if !hs.isHealthy {
 		hs.isHealthy = true
+
 		hs.routeListener.addRoute(hs.endpoint, route)
 	}
 }

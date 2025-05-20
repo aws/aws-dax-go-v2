@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-dax-go-v2/dax/internal/cbor"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -95,7 +96,9 @@ func TestTubePoolConnectionCache(t *testing.T) {
 	}
 	defer listener.Close()
 
-	pool := newTubePoolWithOptions(endpoint, tubePoolOptions{10, time.Second * 1, defaultDialer.DialContext}, connConfigData)
+	tmp := &testMeterProvider{}
+	sdkMetrics, _ := buildDaxSdkMetrics(tmp)
+	pool := newTubePoolWithOptions(endpoint, tubePoolOptions{10, time.Second * 1, defaultDialer.DialContext}, connConfigData, sdkMetrics)
 
 	// verify tube is re-used
 	expectedConnections = 1
@@ -174,6 +177,14 @@ func TestTubePoolConnectionCache(t *testing.T) {
 			t.Errorf("expected most recent tube")
 		}
 	}
+
+	expectCounters(t, sdkMetrics, map[string]int{
+		daxConnectionsCreated: 3,
+	})
+	expectGauges(t, sdkMetrics, map[string]int{
+		daxConcurrentConnectionAttempts: 0,
+		daxConnectionsIdle:              0,
+	})
 }
 
 func TestTubePool_reapIdleTubes(t *testing.T) {
@@ -186,7 +197,9 @@ func TestTubePool_reapIdleTubes(t *testing.T) {
 	}
 	defer listener.Close()
 
-	pool := newTubePool(endpoint, connConfigData)
+	tmp := &testMeterProvider{}
+	sdkMetrics, _ := buildDaxSdkMetrics(tmp)
+	pool := newTubePool(endpoint, connConfigData, sdkMetrics)
 
 	tubeCount := 10
 	tubes := make([]tube, tubeCount)
@@ -243,6 +256,11 @@ func TestTubePool_reapIdleTubes(t *testing.T) {
 	if countTubes(pool) != count+1 {
 		t.Errorf("expected cached tube count %v, actual %v", count+1, countTubes(pool))
 	}
+
+	expectCounters(t, sdkMetrics, map[string]int{
+		daxConnectionsCreated:    10,
+		daxConnectionsClosedIdle: -1,
+	})
 }
 
 func TestTubePool_Close(t *testing.T) {
@@ -255,7 +273,9 @@ func TestTubePool_Close(t *testing.T) {
 	}
 	defer listener.Close()
 
-	pool := newTubePoolWithOptions(endpoint, tubePoolOptions{1, time.Second * 1, defaultDialer.DialContext}, connConfigData)
+	tmp := &testMeterProvider{}
+	sdkMetrics, _ := buildDaxSdkMetrics(tmp)
+	pool := newTubePoolWithOptions(endpoint, tubePoolOptions{1, time.Second * 1, defaultDialer.DialContext}, connConfigData, sdkMetrics)
 	tubes := make([]tube, 2)
 	for i := 0; i < 2; i++ {
 		tubes[i], err = pool.get()
@@ -297,11 +317,40 @@ func TestTubePool_Close(t *testing.T) {
 	if tubeCount := countTubes(pool); tubeCount != 0 {
 		t.Fatalf("Tube returned to a closed pool changed its size. Pool size: %d", tubeCount)
 	}
+
+	assert.Len(t, tmp.meters, 1)
+	s, ok := tmp.meters[daxMeterScope]
+	assert.True(t, ok, fmt.Sprintf(`expected key "%s" to exist in meters map`, daxMeterScope))
+	assert.NotNil(t, s)
+	if !ok || s == nil {
+		return
+	}
+
+	expectCounters(t, sdkMetrics, map[string]int{
+		daxConnectionsCreated:       2,
+		daxConnectionsClosedSession: 1,
+	})
+	expectGauges(t, sdkMetrics, map[string]int{
+		daxConcurrentConnectionAttempts: 0,
+		daxConnectionsIdle:              0,
+	})
 }
 
 func TestTubePoolError(t *testing.T) {
 	endpoint := ":8184"
-	pool := newTubePoolWithOptions(endpoint, tubePoolOptions{10, time.Second * 1, defaultDialer.DialContext}, connConfigData)
+
+	tmp := &testMeterProvider{}
+	sdkMetrics, _ := buildDaxSdkMetrics(tmp)
+
+	pool := newTubePoolWithOptions(endpoint, tubePoolOptions{10, time.Second * 1, defaultDialer.DialContext}, connConfigData, sdkMetrics)
+
+	go func() {
+		time.After(time.Millisecond * 20)
+		expectGauges(t, sdkMetrics, map[string]int{
+			daxConcurrentConnectionAttempts: 1,
+		})
+	}()
+
 	_, err := pool.get()
 	if err == nil || !strings.Contains(err.Error(), "connection refused") {
 		t.Errorf("expected 'dial tcp :8184: connection refused', actual '%v'\n", err)
@@ -311,11 +360,15 @@ func TestTubePoolError(t *testing.T) {
 func TestTubePoolErrorWithCustomDialContext(t *testing.T) {
 	endpoint := ":8185"
 	var numDials int64
+
+	tmp := &testMeterProvider{}
+	sdkMetrics, _ := buildDaxSdkMetrics(tmp)
+
 	pool := newTubePoolWithOptions(endpoint, tubePoolOptions{10, time.Second * 1, func(ctx context.Context, network, address string) (net.Conn, error) {
 		atomic.AddInt64(&numDials, 1)
 		var d net.Dialer
 		return d.DialContext(ctx, network, address)
-	}}, connConfigData)
+	}}, connConfigData, sdkMetrics)
 	_, err := pool.get()
 	if err == nil || !strings.Contains(err.Error(), "connection refused") {
 		t.Errorf("expected 'dial tcp :8184: connection refused', actual '%v'\n", err)
@@ -345,7 +398,9 @@ func TestConnectionPriority(t *testing.T) {
 		return d.DialContext(ctx, network, address)
 	}
 
-	pool := newTubePoolWithOptions(endpoint, tubePoolOptions{maxAttempts, 1 * time.Second, defaultDialer.DialContext}, connConfigData)
+	tmp := &testMeterProvider{}
+	sdkMetrics, _ := buildDaxSdkMetrics(tmp)
+	pool := newTubePoolWithOptions(endpoint, tubePoolOptions{maxAttempts, 1 * time.Second, defaultDialer.DialContext}, connConfigData, sdkMetrics)
 	pool.dialContext = connectFn
 	defer pool.Close()
 
@@ -381,6 +436,10 @@ func TestConnectionPriority(t *testing.T) {
 	}
 
 	wg.Wait()
+
+	expectCounters(t, sdkMetrics, map[string]int{
+		daxConnectionsCreated: 6,
+	})
 }
 
 func TestGetWithClosedErrorChannel(t *testing.T) {
@@ -393,7 +452,10 @@ func TestGetWithClosedErrorChannel(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Add(1)
-	pool := newTubePoolWithOptions(endpoint, tubePoolOptions{1, 10 * time.Second, defaultDialer.DialContext}, connConfigData)
+
+	tmp := &testMeterProvider{}
+	sdkMetrics, _ := buildDaxSdkMetrics(tmp)
+	pool := newTubePoolWithOptions(endpoint, tubePoolOptions{1, 10 * time.Second, defaultDialer.DialContext}, connConfigData, sdkMetrics)
 	pool.dialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 		wg.Done()
 		// Block indefinetely to mimic a long connection
@@ -404,6 +466,11 @@ func TestGetWithClosedErrorChannel(t *testing.T) {
 
 	go func() {
 		wg.Wait()
+
+		expectGauges(t, sdkMetrics, map[string]int{
+			daxConcurrentConnectionAttempts: 1,
+		})
+
 		pool.Close()
 	}()
 
@@ -510,7 +577,9 @@ func countTubes(pool *tubePool) int {
 }
 
 func TestTubePool_close(t *testing.T) {
-	p := newTubePoolWithOptions(":1234", tubePoolOptions{1, 5 * time.Second, defaultDialer.DialContext}, connConfigData)
+	tmp := &testMeterProvider{}
+	sdkMetrics, _ := buildDaxSdkMetrics(tmp)
+	p := newTubePoolWithOptions(":1234", tubePoolOptions{1, 5 * time.Second, defaultDialer.DialContext}, connConfigData, sdkMetrics)
 	origSession := p.session
 	p.closeTubeImmediately = true
 
@@ -519,10 +588,16 @@ func TestTubePool_close(t *testing.T) {
 	p.closeTube(tt)
 	require.Equal(t, origSession, p.session)
 	tt.AssertCalled(t, "Close")
+
+	expectCounters(t, sdkMetrics, map[string]int{
+		daxConnectionsClosedError: 1,
+	})
 }
 
 func TestTubePool_PutClosesTubesIfPoolIsClosed(t *testing.T) {
-	p := newTubePoolWithOptions(":1234", tubePoolOptions{1, 5 * time.Second, defaultDialer.DialContext}, connConfigData)
+	tmp := &testMeterProvider{}
+	sdkMetrics, _ := buildDaxSdkMetrics(tmp)
+	p := newTubePoolWithOptions(":1234", tubePoolOptions{1, 5 * time.Second, defaultDialer.DialContext}, connConfigData, sdkMetrics)
 	p.closed = true
 
 	tt := &mockTube{}
@@ -532,10 +607,16 @@ func TestTubePool_PutClosesTubesIfPoolIsClosed(t *testing.T) {
 	p.put(tt)
 
 	tt.AssertExpectations(t)
+
+	expectCounters(t, sdkMetrics, map[string]int{
+		daxConnectionsClosedSession: 1,
+	})
 }
 
 func TestTubePool_PutClosesTubesFromDifferentSession(t *testing.T) {
-	p := newTubePoolWithOptions(":1234", tubePoolOptions{1, 5 * time.Second, defaultDialer.DialContext}, connConfigData)
+	tmp := &testMeterProvider{}
+	sdkMetrics, _ := buildDaxSdkMetrics(tmp)
+	p := newTubePoolWithOptions(":1234", tubePoolOptions{1, 5 * time.Second, defaultDialer.DialContext}, connConfigData, sdkMetrics)
 
 	tt := &mockTube{}
 	tt.On("Session").Return(p.session + 100)
@@ -544,4 +625,8 @@ func TestTubePool_PutClosesTubesFromDifferentSession(t *testing.T) {
 	p.put(tt)
 
 	tt.AssertExpectations(t)
+
+	expectCounters(t, sdkMetrics, map[string]int{
+		daxConnectionsClosedSession: 1,
+	})
 }

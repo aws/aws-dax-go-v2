@@ -21,6 +21,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-dax-go-v2/dax/internal/proxy"
@@ -49,7 +50,12 @@ type tubePool struct {
 	session    session // protected by mutex
 	waiters    chan tube
 
+	pending int64 // 64 bit for pending gauge convenience
+	idle    int64 // 64 bit for idle gauge convenience
+
 	connConfig connConfig
+
+	daxSdkMetrics *daxSdkMetrics
 }
 
 type tubePoolOptions struct {
@@ -63,12 +69,12 @@ var defaultDialer = &net.Dialer{}
 var defaultTubePoolOptions = tubePoolOptions{maxConcurrentConnAttempts: 10, timeout: time.Second * 5}
 
 // Creates a new pool using defaultTubePoolOptions and associated with given address.
-func newTubePool(address string, connConfigData connConfig) *tubePool {
-	return newTubePoolWithOptions(address, defaultTubePoolOptions, connConfigData)
+func newTubePool(address string, connConfigData connConfig, sdkMetrics *daxSdkMetrics) *tubePool {
+	return newTubePoolWithOptions(address, defaultTubePoolOptions, connConfigData, sdkMetrics)
 }
 
 // Creates a new pool with provided options associated with the given address.
-func newTubePoolWithOptions(address string, options tubePoolOptions, connConfigData connConfig) *tubePool {
+func newTubePoolWithOptions(address string, options tubePoolOptions, connConfigData connConfig, sdkMetrics *daxSdkMetrics) *tubePool {
 	if options.maxConcurrentConnAttempts <= 0 {
 		options.maxConcurrentConnAttempts = defaultTubePoolOptions.maxConcurrentConnAttempts
 	}
@@ -98,7 +104,11 @@ func newTubePoolWithOptions(address string, options tubePoolOptions, connConfigD
 		timeout:     options.timeout,
 		dialContext: options.dialContext,
 
-		connConfig: connConfigData,
+		pending: 0,
+		idle:    0,
+
+		connConfig:    connConfigData,
+		daxSdkMetrics: sdkMetrics,
 	}
 }
 
@@ -110,6 +120,7 @@ func (p *tubePool) get() (tube, error) {
 		ctx, cancelFn = context.WithTimeout(ctx, p.timeout)
 		defer cancelFn()
 	}
+
 	return p.getWithContext(ctx, false, RequestOptions{})
 }
 
@@ -131,6 +142,8 @@ func (p *tubePool) getWithContext(ctx context.Context, highPriority bool, opt Re
 				p.lastActive = p.top
 			}
 			t.SetNext(nil)
+			atomic.AddInt64(&p.idle, -1)
+			gaugeInt64(context.Background(), p.daxSdkMetrics, daxConnectionsIdle, atomic.LoadInt64(&p.idle))
 			p.mutex.Unlock()
 			return t, nil
 		}
@@ -178,6 +191,14 @@ func (p *tubePool) getWithContext(ctx context.Context, highPriority bool, opt Re
 // Allocates a new tube and optionally releases the gate.
 // If done channel isn't nil the new tube will be send there as opposed to idle tubes stack.
 func (p *tubePool) allocAndReleaseGate(session int64, done chan tube, releaseGate bool, opt RequestOptions) {
+	atomic.AddInt64(&p.pending, 1)
+	gaugeInt64(context.Background(), p.daxSdkMetrics, daxConcurrentConnectionAttempts, atomic.LoadInt64(&p.pending))
+
+	defer func() {
+		atomic.AddInt64(&p.pending, -1)
+		gaugeInt64(context.Background(), p.daxSdkMetrics, daxConcurrentConnectionAttempts, atomic.LoadInt64(&p.pending))
+	}()
+
 	tube, err := p.alloc(session, opt)
 	if releaseGate {
 		p.gate.exit()
@@ -218,6 +239,9 @@ func (p *tubePool) put(t tube) {
 	if p.closed || t.Session() != p.session {
 		t.Close()
 		// Waiters channel was already closed in Close
+
+		countMetricInt64(context.Background(), p.daxSdkMetrics, daxConnectionsClosedSession, 1)
+
 		return
 	}
 
@@ -233,6 +257,9 @@ func (p *tubePool) put(t tube) {
 
 	t.SetNext(p.top)
 	p.top = t
+
+	atomic.AddInt64(&p.idle, 1)
+	gaugeInt64(context.Background(), p.daxSdkMetrics, daxConnectionsIdle, atomic.LoadInt64(&p.idle))
 }
 
 // Make sure to closeTube the tube if you are not sure that the tube is clean
@@ -242,6 +269,9 @@ func (p *tubePool) closeTube(t tube) {
 	if t == nil {
 		return
 	}
+
+	countMetricInt64(context.Background(), p.daxSdkMetrics, daxConnectionsClosedError, 1)
+
 	if p.closeTubeImmediately {
 		t.Close()
 	} else {
@@ -292,6 +322,8 @@ func (p *tubePool) clearIdleConnections() tube {
 	head := p.top
 	p.top = nil
 	p.lastActive = nil
+	atomic.StoreInt64(&p.idle, 0)
+	gaugeInt64(context.Background(), p.daxSdkMetrics, daxConnectionsIdle, atomic.LoadInt64(&p.idle))
 	return head
 }
 
@@ -309,7 +341,13 @@ func (p *tubePool) reapIdleConnections() {
 	}
 	p.mutex.Unlock()
 	// closing tubes synchronously as this method is expected to be called from a background goroutine
-	p.closeAll(reapHead)
+	reapCount := p.closeAll(reapHead)
+
+	// Update the gauge after reaping
+	if reapCount > 0 {
+		atomic.AddInt64(&p.idle, -reapCount)
+		gaugeInt64(context.Background(), p.daxSdkMetrics, daxConnectionsIdle, atomic.LoadInt64(&p.idle))
+	}
 }
 
 // Allocates a new tube by establishing a new connection and performing initialization.
@@ -325,18 +363,28 @@ func (p *tubePool) alloc(session int64, opt RequestOptions) (tube, error) {
 		p.debugLog(opt, "Error in allocating new tube for %s : %s", conn.RemoteAddr(), err)
 		return nil, err
 	}
+
+	countMetricInt64(context.Background(), p.daxSdkMetrics, daxConnectionsCreated, 1)
+
 	return t, nil
 }
 
 // Traverses the passed stack and closes all tubes in it.
-func (p *tubePool) closeAll(head tube) {
+func (p *tubePool) closeAll(head tube) int64 {
 	var next tube
+	c := int64(0)
+
 	for head != nil {
 		next = head.Next()
 		head.SetNext(nil)
 		head.Close()
 		head = next
+		c++
 	}
+
+	countMetricInt64(context.Background(), p.daxSdkMetrics, daxConnectionsClosedIdle, c)
+
+	return c
 }
 
 // Increases the session version.

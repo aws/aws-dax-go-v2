@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/aws/aws-dax-go-v2/dax/internal/cbor"
@@ -29,6 +30,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/aws/smithy-go"
 	"github.com/aws/smithy-go/logging"
+	"github.com/aws/smithy-go/metrics"
 )
 
 const (
@@ -76,16 +78,35 @@ type SingleDaxClient struct {
 	attrListIdToNames *lru.Lru
 
 	healthStatus HealthStatus
+
+	daxSdkMetrics *daxSdkMetrics
 }
 
-func NewSingleClient(endpoint string, connConfigData connConfig, region string, credentials aws.CredentialsProvider, routeListener RouteListener) (*SingleDaxClient, error) {
-	return newSingleClientWithOptions(endpoint, connConfigData, region, credentials, -1, defaultDialer.DialContext, routeListener)
+func NewSingleClient(endpoint string, connConfigData connConfig, region string, credentials aws.CredentialsProvider, routeListener RouteListener, sdkMetrics *daxSdkMetrics) (*SingleDaxClient, error) {
+	return newSingleClientWithOptions(endpoint, connConfigData, region, credentials, -1, defaultDialer.DialContext, routeListener, sdkMetrics)
 }
 
-func newSingleClientWithOptions(endpoint string, connConfigData connConfig, region string, credentials aws.CredentialsProvider, maxPendingConnections int, dialContextFn dialContext, routeListener RouteListener) (*SingleDaxClient, error) {
+func newSingleClientWithOptions(
+	endpoint string,
+	connConfigData connConfig,
+	region string,
+	credentials aws.CredentialsProvider,
+	maxPendingConnections int,
+	dialContextFn dialContext,
+	routeListener RouteListener,
+	sdkMetrics *daxSdkMetrics,
+) (*SingleDaxClient, error) {
 	po := defaultTubePoolOptions
 	if maxPendingConnections > 0 {
 		po.maxConcurrentConnAttempts = maxPendingConnections
+	}
+
+	if sdkMetrics == nil {
+		var err error
+		sdkMetrics, err = buildDaxSdkMetrics(&metrics.NopMeterProvider{})
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	po.dialContext = dialContextFn
@@ -94,9 +115,10 @@ func newSingleClientWithOptions(endpoint string, connConfigData connConfig, regi
 		region:             region,
 		credentials:        credentials,
 		tubeAuthWindowSecs: authTtlSecs * tubeAuthWindowScalar,
-		pool:               newTubePoolWithOptions(endpoint, po, connConfigData),
+		pool:               newTubePoolWithOptions(endpoint, po, connConfigData, sdkMetrics),
 		executor:           newExecutor(),
 		healthStatus:       newHealthStatus(endpoint, routeListener),
+		daxSdkMetrics:      sdkMetrics,
 	}
 
 	client.keySchema = &lru.Lru{
@@ -264,6 +286,7 @@ func (client *SingleDaxClient) PutItemWithOptions(ctx context.Context, input *dy
 		output, err = decodePutItemOutput(ctx, reader, input, client.keySchema, client.attrListIdToNames, output)
 		return err
 	}
+
 	if err = client.executeWithRetries(ctx, OpPutItem, opt, encoder, decoder); err != nil {
 		return output, err
 	}
@@ -393,7 +416,7 @@ func (client *SingleDaxClient) TransactWriteItemsWithOptions(ctx context.Context
 		output, err = decodeTransactWriteItemsOutput(ctx, reader, input, client.keySchema, client.attrListIdToNames, output)
 		return err
 	}
-	if err = client.executeWithRetries(ctx, OpBatchWriteItem, opt, encoder, decoder); err != nil {
+	if err = client.executeWithRetries(ctx, OpTransactWriteItems, opt, encoder, decoder); err != nil {
 		if failure, ok := err.(*daxTransactionCanceledFailure); ok {
 			var cancellationReasons []types.CancellationReason
 			if cancellationReasons, err = decodeTransactionCancellationReasons(ctx, failure, extractedKeys, client.attrListIdToNames); err != nil {
@@ -417,7 +440,7 @@ func (client *SingleDaxClient) TransactGetItemsWithOptions(ctx context.Context, 
 		output, err = decodeTransactGetItemsOutput(ctx, reader, input, client.keySchema, client.attrListIdToNames, output)
 		return err
 	}
-	if err = client.executeWithRetries(ctx, OpBatchWriteItem, opt, encoder, decoder); err != nil {
+	if err = client.executeWithRetries(ctx, OpTransactGetItems, opt, encoder, decoder); err != nil {
 		if failure, ok := err.(*daxTransactionCanceledFailure); ok {
 			var cancellationReasons []types.CancellationReason
 			if cancellationReasons, err = decodeTransactionCancellationReasons(ctx, failure, extractedKeys, client.attrListIdToNames); err != nil {
@@ -442,7 +465,6 @@ func (client *SingleDaxClient) newContext(ctx context.Context, o RequestOptions)
 }
 
 func (client *SingleDaxClient) executeWithRetries(ctx context.Context, op string, o RequestOptions, encoder func(writer *cbor.Writer) error, decoder func(reader *cbor.Reader) error) error {
-
 	ctx = client.newContext(ctx, o)
 
 	var err error
@@ -477,7 +499,21 @@ func (client *SingleDaxClient) executeWithRetries(ctx context.Context, op string
 	return translateError(err)
 }
 
-func (client *SingleDaxClient) executeWithContext(ctx context.Context, op string, encoder func(writer *cbor.Writer) error, decoder func(reader *cbor.Reader) error, opt RequestOptions) error {
+func (client *SingleDaxClient) executeWithContext(ctx context.Context, op string, encoder func(writer *cbor.Writer) error, decoder func(reader *cbor.Reader) error, opt RequestOptions) (out error) {
+	startTime := time.Now()
+
+	defer func() {
+		histogramMicrosecondsInt64(ctx, client.daxSdkMetrics, fmt.Sprintf(daxOpNameLatencyUs, op), startTime)
+
+		if out != nil {
+			countMetricInt64(ctx, client.daxSdkMetrics, fmt.Sprintf(daxOpNameFailure, op), 1)
+
+			return
+		}
+
+		countMetricInt64(ctx, client.daxSdkMetrics, fmt.Sprintf(daxOpNameSuccess, op), 1)
+	}()
+
 	t, err := client.pool.getWithContext(ctx, client.isHighPriority(op), opt)
 	if err != nil {
 		return err
@@ -509,13 +545,17 @@ func (client *SingleDaxClient) executeWithContext(ctx context.Context, op string
 		client.pool.closeTube(t)
 		return err
 	}
+
+	// actual request is sent here
 	if err := writer.Flush(); err != nil {
 		client.pool.closeTube(t)
+
 		return err
 	}
 
 	reader := t.CborReader()
 	ex, err := decodeError(reader)
+
 	if err != nil { // decode or network error - doesn't guarantee completely drained tube
 		client.pool.closeTube(t)
 		return err
@@ -532,6 +572,7 @@ func (client *SingleDaxClient) executeWithContext(ctx context.Context, op string
 	} else {
 		client.pool.put(t)
 	}
+
 	return err
 }
 
@@ -568,22 +609,29 @@ func (client *SingleDaxClient) recycleTube(t tube, err error) {
 }
 func (client *SingleDaxClient) auth(ctx context.Context, t tube) error {
 	// TODO credentials.Get() cause a throughput drop of ~25 with 250 goroutines with DefaultCredentialChain (only instance profile credentials available)
+
 	creds, err := client.credentials.Retrieve(ctx)
+
 	if err != nil {
 		return err
 	}
+
 	now := time.Now().UTC()
 	if t.CompareAndSwapAuthID(creds.AccessKeyID) || t.AuthExpiryUnix() <= now.Unix() {
 		stringToSign, signature := generateSigV4WithTime(creds, daxAddress, client.region, "", now)
 		writer := t.CborWriter()
+
 		if err := encodeAuthInput(creds.AccessKeyID, creds.SessionToken, stringToSign, signature, userAgent, writer); err != nil {
 			return err
 		}
+
 		if err := writer.Flush(); err != nil {
 			return err
 		}
+
 		t.SetAuthExpiryUnix(now.Unix() + client.tubeAuthWindowSecs)
 	}
+
 	return nil
 }
 

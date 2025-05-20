@@ -17,6 +17,8 @@ package client
 
 import (
 	"context"
+	"net"
+	"os"
 	"testing"
 	"time"
 
@@ -73,7 +75,10 @@ func (m mockDaxAPI) endpoints(ctx context.Context, opt RequestOptions) ([]servic
 }
 
 func Test_disabledRouteManager(t *testing.T) {
-	rm := newRouteManager(false, time.Second, nil, utils.LogOff)
+	tmp := &testMeterProvider{}
+	om, _ := buildDaxSdkMetrics(tmp)
+
+	rm := newRouteManager(false, time.Second, nil, utils.LogOff, om)
 	defer rm.close()
 	if rm.isEnabled {
 		t.Errorf("Expected route manager to be disabled")
@@ -88,10 +93,18 @@ func Test_disabledRouteManager(t *testing.T) {
 	if len(rm.routes) != 0 {
 		t.Errorf("addRoute getting called even with routeManager disabled")
 	}
+
+	expectCounters(t, om, map[string]int{
+		daxRouteManagerRoutesAdded:   0,
+		daxRouteManagerRoutesRemoved: 0,
+	})
 }
 
 func Test_setRoutes(t *testing.T) {
-	rm := newRouteManager(true, time.Second, nil, utils.LogOff)
+	tmp := &testMeterProvider{}
+	om, _ := buildDaxSdkMetrics(tmp)
+
+	rm := newRouteManager(true, time.Second, nil, utils.LogOff, om)
 	defer rm.close()
 	if len(rm.routes) != 0 {
 		t.Errorf("Expected empty routes list, got %v", rm.routes)
@@ -102,7 +115,10 @@ func Test_setRoutes(t *testing.T) {
 	}
 }
 func Test_getRoute(t *testing.T) {
-	rm := newRouteManager(true, time.Second, nil, utils.LogOff)
+	tmp := &testMeterProvider{}
+	om, _ := buildDaxSdkMetrics(tmp)
+
+	rm := newRouteManager(true, time.Second, nil, utils.LogOff, om)
 	defer rm.close()
 	if rm.getRoute(nil) != nil {
 		t.Errorf("Expected nil route, got other")
@@ -122,7 +138,10 @@ func Test_getRoute(t *testing.T) {
 }
 
 func Test_addRoute(t *testing.T) {
-	rm := newRouteManager(true, time.Second, nil, utils.LogOff)
+	tmp := &testMeterProvider{}
+	om, _ := buildDaxSdkMetrics(tmp)
+
+	rm := newRouteManager(true, time.Second, nil, utils.LogOff, om)
 	defer rm.close()
 	if len(rm.routes) != 0 {
 		t.Errorf("Expected empty routes list, got %v", rm.routes)
@@ -131,10 +150,18 @@ func Test_addRoute(t *testing.T) {
 	if len(rm.routes) != 1 {
 		t.Errorf("Expected one route but got %v", rm.routes)
 	}
+
+	expectCounters(t, om, map[string]int{
+		daxRouteManagerRoutesAdded:   1,
+		daxRouteManagerRoutesRemoved: 0,
+	})
 }
 
 func Test_removeRoute(t *testing.T) {
-	rm := newRouteManager(true, time.Second, nil, utils.LogOff)
+	tmp := &testMeterProvider{}
+	om, _ := buildDaxSdkMetrics(tmp)
+
+	rm := newRouteManager(true, time.Second, nil, utils.LogOff, om)
 	defer rm.close()
 	if len(rm.routes) != 0 {
 		t.Errorf("Expected empty routes list, got %v", rm.routes)
@@ -162,6 +189,12 @@ func Test_removeRoute(t *testing.T) {
 	if len(rm.routes) != len(dummyHostClientMap) {
 		t.Errorf("Expected two routes but got %v", rm.routes)
 	}
+
+	expectCounters(t, om, map[string]int{
+		daxRouteManagerRoutesAdded:    0,
+		daxRouteManagerRoutesRemoved:  1,
+		daxRouteManagerFailOpenEvents: 1,
+	})
 }
 
 func Test_removeRouteFailOpen(t *testing.T) {
@@ -173,7 +206,10 @@ func Test_removeRouteFailOpen(t *testing.T) {
 		hostPort{"dummy.2", 9111}: {client: daxAPI2},
 		hostPort{"dummy.3", 9111}: {client: daxAPI3},
 	}
-	rm := newRouteManager(true, time.Second, nil, utils.LogOff)
+	tmp := &testMeterProvider{}
+	om, _ := buildDaxSdkMetrics(tmp)
+
+	rm := newRouteManager(true, time.Second, nil, utils.LogOff, om)
 	defer rm.close()
 	if len(rm.routes) != 0 {
 		t.Errorf("Expected empty routes list, got %v", rm.routes)
@@ -200,10 +236,19 @@ func Test_removeRouteFailOpen(t *testing.T) {
 	if rm.isEnabled {
 		t.Errorf("Fail Open didn't work as expected")
 	}
+
+	expectCounters(t, om, map[string]int{
+		daxRouteManagerRoutesAdded:    0,
+		daxRouteManagerRoutesRemoved:  3,
+		daxRouteManagerFailOpenEvents: 3,
+	})
 }
 
 func Test_verifyAndDisable(t *testing.T) {
-	rm := newRouteManager(true, time.Second, nil, utils.LogOff)
+	tmp := &testMeterProvider{}
+	om, _ := buildDaxSdkMetrics(tmp)
+
+	rm := newRouteManager(true, time.Second, nil, utils.LogOff, om)
 	defer rm.close()
 	rm.disableDuration = 100 * time.Millisecond
 	rm.failOpenTimeList = []time.Time{time.Now(), time.Now(), time.Now()}
@@ -227,7 +272,10 @@ func Test_verifyAndDisable(t *testing.T) {
 }
 
 func Test_rebuildRoutes(t *testing.T) {
-	rm := newRouteManager(true, time.Second, nil, utils.LogOff)
+	tmp := &testMeterProvider{}
+	om, _ := buildDaxSdkMetrics(tmp)
+
+	rm := newRouteManager(true, time.Second, nil, utils.LogOff, om)
 	defer rm.close()
 	daxAPI1 := mockDaxAPI{}
 	daxAPI2 := mockDaxAPI{}
@@ -247,7 +295,10 @@ func Test_rebuildRoutes(t *testing.T) {
 }
 
 func Test_stopTimer(t *testing.T) {
-	rm := newRouteManager(true, time.Second, nil, utils.LogOff)
+	tmp := &testMeterProvider{}
+	om, _ := buildDaxSdkMetrics(tmp)
+
+	rm := newRouteManager(true, time.Second, nil, utils.LogOff, om)
 	defer rm.close()
 	timer := time.AfterFunc(rm.disableDuration, func() { rm.isEnabled = true })
 	rm.timer = timer
@@ -258,4 +309,51 @@ func Test_stopTimer(t *testing.T) {
 	if timer.Stop() {
 		t.Errorf("stopTimer didn't stop the timer")
 	}
+}
+
+func Test_daxConnectionsIdle(t *testing.T) {
+	tmp := &testMeterProvider{}
+	om, _ := buildDaxSdkMetrics(tmp)
+
+	tp := newTubePoolWithOptions(
+		"test",
+		tubePoolOptions{
+			maxConcurrentConnAttempts: 20,
+			dialContext: func(ctx context.Context, network string, address string) (net.Conn, error) {
+				<-time.After(time.Second)
+				return nil, os.ErrClosed
+			},
+		},
+		connConfig{},
+		om,
+	)
+
+	for range 10 {
+		go func() {
+			tp.get()
+		}()
+	}
+
+	<-time.After(time.Millisecond * 10)
+
+	expectGauges(t, om, map[string]int{
+		daxConcurrentConnectionAttempts: 10,
+	})
+
+	for range 10 {
+		go func() {
+			tp.get()
+		}()
+	}
+	<-time.After(time.Millisecond * 10)
+
+	expectGauges(t, om, map[string]int{
+		daxConcurrentConnectionAttempts: 20,
+	})
+
+	<-time.After(time.Second)
+
+	expectGauges(t, om, map[string]int{
+		daxConcurrentConnectionAttempts: 0,
+	})
 }
