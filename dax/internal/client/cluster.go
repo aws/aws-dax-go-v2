@@ -17,6 +17,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -29,6 +30,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aws/aws-dax-go-v2/dax/types"
 	"github.com/aws/aws-dax-go-v2/dax/utils"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -74,6 +76,7 @@ type Config struct {
 	logLevel                 utils.LogLevelType
 
 	RouteManagerEnabled bool // this flag temporarily removes routes facing network errors.
+	IpDiscovery         types.IpDiscovery
 }
 
 type connConfig struct {
@@ -94,6 +97,9 @@ func (cfg *Config) validate() error {
 	}
 	if cfg.MaxPendingConnectionsPerHost < 0 {
 		return NewCustomInvalidParamError("ConfigValidation", "MaxPendingConnectionsPerHost cannot be negative")
+	}
+	if !cfg.IpDiscovery.IsValid() {
+		return smithy.NewErrParamRequired("config.IpDiscovery must be 'ipv4' or 'ipv6'")
 	}
 	return nil
 }
@@ -127,6 +133,7 @@ func DefaultConfig() Config {
 		logLevel:                 utils.LogOff,
 		IdleConnectionReapDelay:  30 * time.Second,
 		RouteManagerEnabled:      false,
+		IpDiscovery:              "",
 	}
 	if cfg.Credentials == nil {
 		conf, err := config.LoadDefaultConfig(context.Background())
@@ -369,6 +376,7 @@ type cluster struct {
 	seeds         []hostPort
 	config        Config
 	clientBuilder clientBuilder
+	IpDiscovery   types.IpDiscovery
 }
 
 type clientAndConfig struct {
@@ -389,7 +397,7 @@ func newCluster(cfg Config) (*cluster, error) {
 	cfg.connConfig.hostname = hostname
 	cfg.validateConnConfig()
 	routeManager := newRouteManager(cfg.RouteManagerEnabled, cfg.ClientHealthCheckInterval, cfg.logger, cfg.logLevel)
-	return &cluster{seeds: seeds, config: cfg, executor: newExecutor(), clientBuilder: &singleClientBuilder{}, routeManager: routeManager}, nil
+	return &cluster{seeds: seeds, config: cfg, executor: newExecutor(), clientBuilder: &singleClientBuilder{}, routeManager: routeManager, IpDiscovery: cfg.IpDiscovery}, nil
 }
 
 func getHostPorts(hosts []string) (hostPorts []hostPort, hostname string, isEncrypted bool, err error) {
@@ -566,7 +574,7 @@ func (c *cluster) refreshNow() error {
 }
 
 // This method is responsible for updating the set of active routes tracked by
-// the clsuter-dax-client in response to updates in the roster.
+// the cluster-dax-client in response to updates in the roster.
 func (c *cluster) update(config []serviceEndpoint) error {
 	newEndpoints := make(map[hostPort]struct{}, len(config))
 	for _, cfg := range config {
@@ -685,9 +693,100 @@ func (c *cluster) hasChanged(cfg []serviceEndpoint) bool {
 	return len(cfg) != len(c.active)
 }
 
+// splitIpAddressesByVersion takes as input a slice of ips or endpoints and separates it into 2 slices:
+// one containing only ipv4 addresses, the other containing only ipv6 addresses, which are returned
+// In case of failure, both returned slices are nil, alongisde an appropriate error message.
+func splitIpAddressesByVersion[T net.IP | serviceEndpoint](items []T) (ipv4 []T, ipv6 []T, err error) {
+	for _, item := range items {
+		var ip net.IP
+
+		switch itemCastedToType := any(item).(type) {
+		case net.IP:
+			ip = itemCastedToType
+		case serviceEndpoint:
+			ip = net.IP(itemCastedToType.address)
+		default:
+			err = errors.New("cannot split addresses: input list has unsupported type")
+			return nil, nil, err
+		}
+
+		if len(ip) == net.IPv4len || len(ip) == net.IPv6len {
+			if ip.To4() != nil {
+				ipv4 = append(ipv4, item)
+			} else {
+				ipv6 = append(ipv6, item)
+			}
+		} else {
+			err = fmt.Errorf("cannot split addresses: invalid IP length of address: %s", ip.String())
+			return nil, nil, err
+		}
+	}
+	return
+}
+
+// selectAddressType checks the configuration (ipv4/ipv6/Dual stack) of a given seed in cluster, based on the discovered IP addresses.
+// Uses the found configuration in conjunction with the user provided IpDiscovery to return the ip set that will be used.
+// In case of cluster config-ipDiscovery missmatch, nil slice is returned, with an appropriate error.
+func selectAddressType[T net.IP | serviceEndpoint](ipv4Addresses []T, ipv6Addresses []T, userProvidedIpDiscovery types.IpDiscovery) ([]T, error) {
+
+	// Determine the supported network type based on the discovered addresses
+	hasIPv4 := len(ipv4Addresses) > 0
+	hasIPv6 := len(ipv6Addresses) > 0
+
+	apiErr := smithy.GenericAPIError{
+		Code:  ErrCodeValidationException,
+		Fault: smithy.FaultClient,
+	}
+
+	currentIpDiscovery := strings.ToLower(userProvidedIpDiscovery.String())
+	switch currentIpDiscovery {
+	case "":
+		if hasIPv4 {
+			return ipv4Addresses, nil
+		} else if hasIPv6 {
+			return ipv6Addresses, nil
+		}
+	case types.IpDiscoveryIPv4.String():
+		if !hasIPv4 {
+			apiErr.Message = fmt.Sprintf("ipDiscovery %s does not match the SupportedNetworkType %s.", currentIpDiscovery, types.IpDiscoveryIPv6)
+			return nil, &apiErr
+		}
+		return ipv4Addresses, nil
+	case types.IpDiscoveryIPv6.String():
+		if !hasIPv6 {
+			apiErr.Message = fmt.Sprintf("ipDiscovery %s does not match the SupportedNetworkType %s.", currentIpDiscovery, types.IpDiscoveryIPv4)
+			return nil, &apiErr
+		}
+		return ipv6Addresses, nil
+	}
+
+	apiErr.Message = fmt.Sprintf("invalid IP discovery type: %s", currentIpDiscovery)
+	return nil, &apiErr
+}
+
+// filterAndSelectAddress takes as input a slice of IPs.s.
+// Firstly, it separates the list of available addresses into 2 slices containing only ipv4 and ipv6 addresses, respectively.
+// Based on these lists, it infers the configuration (ipv4/ipv6/Dual stack) of the given nodes in cluster.
+// Finally, it uses the found config type, in conjunction with the user provided IpDiscovery, for
+// deciding which ip set will be used, hence being returned.
+// In case of missmatch cluster config - ipDiscovery, an appropriate error message is returned, alongisde nil slice.
+func filterAndSelectAddress[T net.IP | serviceEndpoint](ipAddresses []T, userProvidedIpDiscovery types.IpDiscovery) ([]T, error) {
+	// Split the seed's ips in 2 separate lists, based on IP type
+	ipv4Addresses, ipv6Addresses, err := splitIpAddressesByVersion(ipAddresses)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return selectAddressType(ipv4Addresses, ipv6Addresses, userProvidedIpDiscovery)
+}
+
 func (c *cluster) pullEndpoints() ([]serviceEndpoint, error) {
 	var lastErr error // TODO chain errors?
+	// Multiple seeds (known nodes with public address) are used as entry points for a given cluster, to handle fault tolerance
 	for _, s := range c.seeds {
+		// Address resolution: determine the IP addresses assigned to each known seed hostname.
+		// A seed hostname can resolve to multiple IPs, both ipv4 and ipv6
 		ips, err := net.LookupIP(s.host)
 		if err != nil {
 			lastErr = err
@@ -702,15 +801,25 @@ func (c *cluster) pullEndpoints() ([]serviceEndpoint, error) {
 			}
 		}
 
-		for _, ip := range ips {
+		// filter the current seed's ip addresses based on user provided IpDiscovery
+		filteredIPsForCurrentSeed, apiErr := filterAndSelectAddress(ips, c.IpDiscovery)
+		if apiErr != nil {
+			c.debugLog("Failed to filter IPs for seed %s:%d with discovery mode %s: %v", s.host, s.port, c.IpDiscovery.String(), apiErr)
+			return nil, apiErr
+		}
+
+		for _, ip := range filteredIPsForCurrentSeed {
 			endpoints, err := c.pullEndpointsFrom(ip, s.port)
 			if err != nil {
+				c.debugLog("Failed to pull endpoint from ip: " + ip.String() + " port: " + strconv.Itoa(s.port))
 				lastErr = err
 				continue
 			}
+
 			c.debugLog("Pulled endpoints from %s : %v", ip, endpoints)
 			if len(endpoints) > 0 {
-				return endpoints, nil
+				// filter the endpoint's ip addresses based on user provided IpDiscovery
+				return filterAndSelectAddress(endpoints, c.IpDiscovery)
 			}
 		}
 	}
@@ -778,7 +887,7 @@ type clientBuilder interface {
 type singleClientBuilder struct{}
 
 func (*singleClientBuilder) newClient(ip net.IP, port int, connConfigData connConfig, region string, credentials aws.CredentialsProvider, maxPendingConnects int, dialContextFn dialContext, routeListener RouteListener) (DaxAPI, error) {
-	endpoint := fmt.Sprintf("%s:%d", ip, port)
+	endpoint := net.JoinHostPort(ip.String(), strconv.Itoa(port))
 	return newSingleClientWithOptions(endpoint, connConfigData, region, credentials, maxPendingConnects, dialContextFn, routeListener)
 }
 

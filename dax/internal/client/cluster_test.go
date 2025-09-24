@@ -20,11 +20,13 @@ import (
 	"fmt"
 	"net"
 	"reflect"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	daxTypes "github.com/aws/aws-dax-go-v2/dax/types"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -436,7 +438,7 @@ func TestCluster_parseHostPorts(t *testing.T) {
 
 func TestCluster_pullFromNextSeed(t *testing.T) {
 	cluster, clientBuilder := newTestCluster([]string{"non-existent-host:8888", "127.0.0.1:8111"})
-	setExpectation(cluster, []serviceEndpoint{{hostname: "localhost", port: 8121}})
+	setExpectation(cluster, []serviceEndpoint{{hostname: "localhost", address: net.ParseIP("127.0.0.1"), port: 8121}})
 
 	if err := cluster.refresh(false); err != nil {
 		t.Errorf("unexpected error %v", err)
@@ -502,7 +504,7 @@ func TestCluster_refreshThreshold(t *testing.T) {
 
 func TestCluster_refreshDup(t *testing.T) {
 	cluster, clientBuilder := newTestCluster([]string{"127.0.0.1:8111"})
-	setExpectation(cluster, []serviceEndpoint{{hostname: "localhost", port: 8121}})
+	setExpectation(cluster, []serviceEndpoint{{hostname: "localhost", address: net.ParseIP("127.0.0.1"), port: 8121}})
 
 	if err := cluster.refreshNow(); err != nil {
 		t.Errorf("unpexected error %v", err)
@@ -540,7 +542,8 @@ func TestCluster_refreshDup(t *testing.T) {
 
 func TestCluster_refreshUpdate(t *testing.T) {
 	cluster, clientBuilder := newTestCluster([]string{"127.0.0.1:8111"})
-	setExpectation(cluster, []serviceEndpoint{{hostname: "localhost", port: 8121}})
+
+	setExpectation(cluster, []serviceEndpoint{{hostname: "localhost", address: net.ParseIP("127.0.0.1"), port: 8121}})
 
 	if err := cluster.refreshNow(); err != nil {
 		t.Errorf("unpexected error %v", err)
@@ -555,7 +558,9 @@ func TestCluster_refreshUpdate(t *testing.T) {
 	assertDiscoveryClient(clientBuilder.clients[0], t)
 	assertActiveClient(clientBuilder.clients[1], t)
 
-	setExpectation(cluster, []serviceEndpoint{{hostname: "localhost", port: 8121}, {hostname: "localhost", port: 8122}})
+	setExpectation(cluster, []serviceEndpoint{
+		{hostname: "localhost", address: net.ParseIP("127.0.0.1"), port: 8121},
+		{hostname: "localhost", address: net.ParseIP("127.0.0.1"), port: 8122}})
 	if err := cluster.refreshNow(); err != nil {
 		t.Errorf("unpexected error %v", err)
 	}
@@ -565,8 +570,9 @@ func TestCluster_refreshUpdate(t *testing.T) {
 	}
 
 	if len(clientBuilder.clients) != 4 {
-		t.Errorf("expected 3, got %d", len(clientBuilder.clients))
+		t.Errorf("expected 4, got %d", len(clientBuilder.clients))
 	}
+
 	assertDiscoveryClient(clientBuilder.clients[2], t)
 	assertActiveClient(clientBuilder.clients[3], t)
 }
@@ -584,7 +590,10 @@ func TestCluster_update(t *testing.T) {
 	assertHealthCheckCalls(cluster, t)
 
 	// add new hosts
-	second := []serviceEndpoint{{hostname: "localhost", port: 8121}, {hostname: "localhost", port: 8122}, {hostname: "localhost", port: 8123}}
+	second := []serviceEndpoint{
+		{hostname: "localhost", address: net.ParseIP("127.0.0.1"), port: 8121},
+		{hostname: "localhost", address: net.ParseIP("127.0.0.1"), port: 8122},
+		{hostname: "localhost", address: net.ParseIP("127.0.0.1"), port: 8123}}
 	if !cluster.hasChanged(second) {
 		t.Errorf("expected config change")
 	}
@@ -679,7 +688,7 @@ func TestCluster_client(t *testing.T) {
 
 func TestCluster_Close(t *testing.T) {
 	cluster, clientBuilder := newTestCluster([]string{"127.0.0.1:8111"})
-	setExpectation(cluster, []serviceEndpoint{{hostname: "localhost", port: 8121}})
+	setExpectation(cluster, []serviceEndpoint{{hostname: "localhost", address: net.ParseIP("127.0.0.1"), port: 8121}})
 
 	if err := cluster.refreshNow(); err != nil {
 		t.Errorf("unpexected error %v", err)
@@ -769,7 +778,7 @@ func Test_MultipleEncryptedEndpoints(t *testing.T) {
 
 func TestCluster_RouteManagerDisabled(t *testing.T) {
 	cluster, clientBuilder := newTestCluster([]string{"non-existent-host:8888", "127.0.0.1:8111"})
-	setExpectation(cluster, []serviceEndpoint{{hostname: "localhost", port: 8121}})
+	setExpectation(cluster, []serviceEndpoint{{hostname: "localhost", address: net.ParseIP("127.0.0.1"), port: 8121}})
 
 	if cluster.isRouteManagerEnabled() {
 		t.Errorf("Route manager should be disabled!")
@@ -793,7 +802,7 @@ func TestCluster_RouteManagerDisabled(t *testing.T) {
 
 func TestCluster_RouteManagerEnabled(t *testing.T) {
 	cluster, clientBuilder := newTestClusterWithRouteManagerEnabled([]string{"non-existent-host:8888", "127.0.0.1:8111"})
-	setExpectation(cluster, []serviceEndpoint{{hostname: "localhost", port: 8121}})
+	setExpectation(cluster, []serviceEndpoint{{hostname: "localhost", address: net.ParseIP("127.0.0.1"), port: 8121}})
 	if !cluster.isRouteManagerEnabled() {
 		t.Errorf("Route manager should be enabled!")
 	}
@@ -911,9 +920,13 @@ func newTestClusterWithRouteManagerEnabled(seeds []string) (*cluster, *testClien
 
 func newTestClusterWithConfig(config Config) (*cluster, *testClientBuilder) {
 	cluster, _ := newCluster(config)
-	b := &testClientBuilder{}
-	cluster.clientBuilder = b
-	return cluster, b
+	if cluster == nil {
+		return nil, nil
+	} else {
+		b := &testClientBuilder{}
+		cluster.clientBuilder = b
+		return cluster, b
+	}
 }
 
 func setExpectation(cluster *cluster, ep []serviceEndpoint) {
@@ -957,6 +970,282 @@ func TestCluster_customDialer(t *testing.T) {
 	wg.Wait()
 
 	assert.Equal(t, magic, string(result[1:8]), "expected the ClusterClient to write to the connection provided by the custom dialer")
+}
+
+func TestCluster_filterAndSelectAddress(t *testing.T) {
+	ipv4Seeds := []net.IP{
+		net.ParseIP("192.0.2.1"),
+		net.ParseIP("198.51.100.42"),
+		net.ParseIP("203.0.113.17"),
+		net.ParseIP("198.51.100.88"),
+		net.ParseIP("192.0.2.99"),
+	}
+
+	ipv6Seeds := []net.IP{
+		net.ParseIP("2001:db8::1"),
+		net.ParseIP("2001:db8:0:1::abcd"),
+		net.ParseIP("2001:db8:abcd:0012::1"),
+		net.ParseIP("2001:db8:ffff::42"),
+		net.ParseIP("2001:db8::dead:beef"),
+	}
+
+	dual_stack_seeds := append(ipv4Seeds, ipv6Seeds...)
+
+	// Define a struct to encapsulate the config, that embeds IpDiscovery, and the desired seeds used for determining cluster type
+	type testInput struct {
+		IpDiscovery daxTypes.IpDiscovery
+		seeds       []net.IP
+	}
+
+	apiErrIpDiscoveryIPv6 := smithy.GenericAPIError{
+		Code:    ErrCodeValidationException,
+		Message: "ipDiscovery ipv6 does not match the SupportedNetworkType ipv4.",
+		Fault:   smithy.FaultClient,
+	}
+
+	apiErrIpDiscoveryIPv4 := apiErrIpDiscoveryIPv6
+	apiErrIpDiscoveryIPv4.Message = "ipDiscovery ipv4 does not match the SupportedNetworkType ipv6."
+
+	// Define test cases inputs and expected outputs
+	cases := []struct {
+		clusterConfigType string
+		input             testInput
+		output            []net.IP
+		err               error
+	}{
+		{"IPv4", testInput{"", ipv4Seeds}, ipv4Seeds, nil},
+		{"IPv4", testInput{IpDiscovery: daxTypes.IpDiscoveryIPv4, seeds: ipv4Seeds}, ipv4Seeds, nil},
+		{"IPv4", testInput{IpDiscovery: daxTypes.IpDiscoveryIPv6, seeds: ipv4Seeds}, nil, &apiErrIpDiscoveryIPv6},
+		{"IPv6", testInput{IpDiscovery: "", seeds: ipv6Seeds}, ipv6Seeds, nil},
+		{"IPv6", testInput{IpDiscovery: daxTypes.IpDiscoveryIPv6, seeds: ipv6Seeds}, ipv6Seeds, nil},
+		{"IPv6", testInput{IpDiscovery: daxTypes.IpDiscoveryIPv4, seeds: ipv6Seeds}, nil, &apiErrIpDiscoveryIPv4},
+		{"Dual stack", testInput{IpDiscovery: "", seeds: dual_stack_seeds}, ipv4Seeds, nil},
+		{"Dual stack", testInput{IpDiscovery: daxTypes.IpDiscoveryIPv4, seeds: dual_stack_seeds}, ipv4Seeds, nil},
+		{"Dual stack", testInput{IpDiscovery: daxTypes.IpDiscoveryIPv6, seeds: dual_stack_seeds}, ipv6Seeds, nil},
+	}
+
+	clusterConfig := DefaultConfig()
+	clusterConfig.Region = "us-east-1"
+
+	// Execute a test for each case
+	for _, testCase := range cases {
+		// Define a convetional name for each test case
+
+		testScenario := " ConfigType: " + testCase.clusterConfigType + " IpDiscovery: " + testCase.input.IpDiscovery.String()
+
+		// Run the test
+		t.Run(testScenario, func(t *testing.T) {
+			// Set clusterConfig fields with data specific to the current test case
+			clusterConfig.IpDiscovery = testCase.input.IpDiscovery
+			// HostPorts must be set in clusterConfig, otherwise the config is not valid in cfg.validate()
+			for _, ip := range testCase.input.seeds {
+				clusterConfig.HostPorts = append(clusterConfig.HostPorts, ip.String()+":8111")
+			}
+			// Create a cluster instance using the config specific to the current test case
+			cluster, _ := newCluster(clusterConfig)
+
+			if cluster == nil {
+				t.Errorf("Couldn't create cluster instance")
+			} else {
+				expectedOutput, err := filterAndSelectAddress(testCase.input.seeds, cluster.IpDiscovery)
+
+				assert.Equal(t, expectedOutput, testCase.output)
+				assert.Equal(t, err, testCase.err)
+			}
+		})
+	}
+}
+
+func TestCluster_filterAndSelectEndpointAddress(t *testing.T) {
+	const (
+		nodeNo int64  = 1708865638
+		portNo int    = 8111
+		region string = "us-east-1"
+	)
+
+	createServiceEndpointFromIP := func(ip string) serviceEndpoint {
+		return serviceEndpoint{nodeId: nodeNo, address: net.ParseIP(ip), port: portNo, availabilityZone: region}
+	}
+
+	ipv4Endpoints := []serviceEndpoint{
+		createServiceEndpointFromIP("192.0.2.1"),
+		createServiceEndpointFromIP("198.51.100.42"),
+		createServiceEndpointFromIP("203.0.113.17"),
+		createServiceEndpointFromIP("198.51.100.88"),
+		createServiceEndpointFromIP("192.0.2.99"),
+	}
+
+	ipv6Endpoints := []serviceEndpoint{
+		createServiceEndpointFromIP("2001:db8::1"),
+		createServiceEndpointFromIP("2001:db8:0:1::abcd"),
+		createServiceEndpointFromIP("2001:db8:abcd:0012::1"),
+		createServiceEndpointFromIP("2001:db8:ffff::42"),
+		createServiceEndpointFromIP("2001:db8::dead:beef"),
+	}
+
+	dual_stack_endpoints := append(ipv4Endpoints, ipv6Endpoints...)
+
+	// Define a struct to encapsulate the config, that embeds IpDiscovery, and the desired seeds used for determining cluster type
+	type testInput struct {
+		IpDiscovery daxTypes.IpDiscovery
+		endpoints   []serviceEndpoint
+	}
+
+	apiErrIpDiscoveryIPv6 := smithy.GenericAPIError{
+		Code:    ErrCodeValidationException,
+		Message: "ipDiscovery ipv6 does not match the SupportedNetworkType ipv4.",
+		Fault:   smithy.FaultClient,
+	}
+
+	apiErrIpDiscoveryIPv4 := apiErrIpDiscoveryIPv6
+	apiErrIpDiscoveryIPv4.Message = "ipDiscovery ipv4 does not match the SupportedNetworkType ipv6."
+
+	// Define test cases inputs and expected outputs
+	cases := []struct {
+		clusterConfigType string
+		input             testInput
+		output            []serviceEndpoint
+		err               error
+	}{
+		{"IPv4", testInput{"", ipv4Endpoints}, ipv4Endpoints, nil},
+		{"IPv4", testInput{IpDiscovery: daxTypes.IpDiscoveryIPv4, endpoints: ipv4Endpoints}, ipv4Endpoints, nil},
+		{"IPv4", testInput{IpDiscovery: daxTypes.IpDiscoveryIPv6, endpoints: ipv4Endpoints}, nil, &apiErrIpDiscoveryIPv6},
+		{"IPv6", testInput{IpDiscovery: "", endpoints: ipv6Endpoints}, ipv6Endpoints, nil},
+		{"IPv6", testInput{IpDiscovery: daxTypes.IpDiscoveryIPv6, endpoints: ipv6Endpoints}, ipv6Endpoints, nil},
+		{"IPv6", testInput{IpDiscovery: daxTypes.IpDiscoveryIPv4, endpoints: ipv6Endpoints}, nil, &apiErrIpDiscoveryIPv4},
+		{"Dual stack", testInput{IpDiscovery: "", endpoints: dual_stack_endpoints}, ipv4Endpoints, nil},
+		{"Dual stack", testInput{IpDiscovery: daxTypes.IpDiscoveryIPv4, endpoints: dual_stack_endpoints}, ipv4Endpoints, nil},
+		{"Dual stack", testInput{IpDiscovery: daxTypes.IpDiscoveryIPv6, endpoints: dual_stack_endpoints}, ipv6Endpoints, nil},
+	}
+
+	clusterConfig := DefaultConfig()
+	clusterConfig.Region = "us-east-1"
+
+	// Execute a test for each case
+	for _, testCase := range cases {
+		// Define a convetional name for each test case
+
+		testScenario := " ConfigType: " + testCase.clusterConfigType + " IpDiscovery: " + testCase.input.IpDiscovery.String()
+
+		// Run the test
+		t.Run(testScenario, func(t *testing.T) {
+			// Set clusterConfig fields with data specific to the current test case
+			clusterConfig.IpDiscovery = testCase.input.IpDiscovery
+			// HostPorts must be set in clusterConfig, otherwise the config is not valid in cfg.validate()
+			for _, endpoint := range testCase.input.endpoints {
+				clusterConfig.HostPorts = append(clusterConfig.HostPorts, (net.IP(endpoint.address)).String()+":"+strconv.Itoa(endpoint.port))
+			}
+			// Create a cluster instance using the config specific to the current test case
+			cluster, _ := newCluster(clusterConfig)
+
+			if cluster == nil {
+				t.Errorf("Couldn't create cluster instance")
+			} else {
+				expectedOutput, err := filterAndSelectAddress(testCase.input.endpoints, cluster.IpDiscovery)
+
+				assert.Equal(t, expectedOutput, testCase.output)
+				assert.Equal(t, err, testCase.err)
+			}
+		})
+	}
+}
+
+func TestCluster_refreshNowForIpDiscovery(t *testing.T) {
+	ipv4ClusterSeeds := []string{
+		"192.0.2.1:8080",
+		"198.51.100.42:8080",
+		"203.0.113.17:8080"}
+
+	expectedEndpointsIPv4 := []serviceEndpoint{
+		{hostname: "localhost", address: net.ParseIP("192.0.2.1"), port: 8121},
+		{hostname: "localhost", address: net.ParseIP("198.51.100.42"), port: 8122},
+		{hostname: "localhost", address: net.ParseIP("203.0.113.17"), port: 8123}}
+
+	ipv6ClusterSeeds := []string{
+		"2001:db8::1:8081",
+		"2001:db8:0:1::abcd:8081",
+		"2001:db8:abcd:0012::1:8081",
+		"2600:1f18:3782:de01:11ed:c16a:5644:4d2e:8081",
+	}
+
+	expectedEndpointsIPv6 := []serviceEndpoint{
+		{hostname: "localhost", address: net.ParseIP("2001:db8::1"), port: 8124},
+		{hostname: "localhost", address: net.ParseIP("2001:db8:0:1::abcd"), port: 8125},
+		{hostname: "localhost", address: net.ParseIP("2001:db8:abcd:0012::1"), port: 8126},
+		{hostname: "localhost", address: net.ParseIP("2600:1f18:3782:de01:11ed:c16a:5644:4d2e"), port: 8127}}
+
+	apiErrIpDiscoveryIPv6 := smithy.GenericAPIError{
+		Code:    ErrCodeValidationException,
+		Message: "ipDiscovery ipv6 does not match the SupportedNetworkType ipv4.",
+		Fault:   smithy.FaultClient,
+	}
+
+	apiErrIpDiscoveryIPv4 := apiErrIpDiscoveryIPv6
+	apiErrIpDiscoveryIPv4.Message = "ipDiscovery ipv4 does not match the SupportedNetworkType ipv6."
+
+	// Define test cases inputs and expected outputs
+	cases := []struct {
+		clusterConfigType string
+		IpDiscovery       daxTypes.IpDiscovery
+		seeds             []string
+		expectedEndpoints []serviceEndpoint
+		err               error
+	}{
+		{"IPv4", "", ipv4ClusterSeeds, expectedEndpointsIPv4, nil},
+		{"IPv4", daxTypes.IpDiscoveryIPv4, ipv4ClusterSeeds, expectedEndpointsIPv4, nil},
+		{"IPv4", daxTypes.IpDiscoveryIPv6, ipv4ClusterSeeds, nil, &apiErrIpDiscoveryIPv6},
+		{"IPv6", "", ipv6ClusterSeeds, expectedEndpointsIPv6, nil},
+		{"IPv6", daxTypes.IpDiscoveryIPv6, ipv6ClusterSeeds, expectedEndpointsIPv6, nil},
+		{"IPv6", daxTypes.IpDiscoveryIPv4, ipv6ClusterSeeds, nil, &apiErrIpDiscoveryIPv4},
+		{"Dual stack", "", append(ipv4ClusterSeeds, ipv6ClusterSeeds...), expectedEndpointsIPv4, nil},
+		{"Dual stack", daxTypes.IpDiscoveryIPv4, append(ipv4ClusterSeeds, ipv6ClusterSeeds...), expectedEndpointsIPv4, nil},
+		{"Dual stack", daxTypes.IpDiscoveryIPv6, append(ipv6ClusterSeeds, ipv4ClusterSeeds...), expectedEndpointsIPv6, nil},
+	}
+
+	// Execute a test for each case
+	for _, testCase := range cases {
+		// Define a convetional name for each test case
+		testScenario := " ConfigType: " + testCase.clusterConfigType + " IpDiscovery: " + testCase.IpDiscovery.String()
+
+		//each test case uses a dfistinct config for creating the cluster instance, hence a distinct cluster instance
+		clusterConfig := DefaultConfig()
+		clusterConfig.Region = "us-west-2"
+		clusterConfig.IpDiscovery = testCase.IpDiscovery
+		clusterConfig.HostPorts = testCase.seeds
+		// Create a cluster instance using the config specific to the current test case
+		cluster, clientBuilder := newTestClusterWithConfig(clusterConfig)
+
+		if cluster == nil {
+			t.Errorf("Couldn't create cluster instance")
+		} else if clientBuilder == nil {
+			t.Errorf("couldn't create clientBuilder")
+		} else {
+			t.Run(testScenario, func(t *testing.T) {
+				setExpectation(cluster, testCase.expectedEndpoints)
+
+				err := cluster.refreshNow()
+
+				assert.Equal(t, err, testCase.err)
+				assertNumRoutes(cluster, len(testCase.expectedEndpoints), t)
+
+				if len(testCase.expectedEndpoints) > 0 && len(clientBuilder.clients) != len(testCase.expectedEndpoints)+1 {
+					t.Errorf("expected %d, got %d", len(testCase.expectedEndpoints)+1, len(clientBuilder.clients))
+				} else if len(testCase.expectedEndpoints) == 0 {
+					assert.Equal(t, len(testCase.expectedEndpoints), len(clientBuilder.clients))
+				}
+
+				assertConnections(cluster, testCase.expectedEndpoints, t)
+
+				for idx := range clientBuilder.clients {
+					if idx == 0 {
+						assertDiscoveryClient(clientBuilder.clients[idx], t)
+					} else {
+						assertActiveClient(clientBuilder.clients[idx], t)
+					}
+				}
+			})
+		}
+	}
 }
 
 func getEndPointResolver(url string) aws.EndpointResolverWithOptions {
