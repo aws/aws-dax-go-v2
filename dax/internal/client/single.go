@@ -594,12 +594,21 @@ func (client *SingleDaxClient) recycleTube(t tube, err error) {
 	if err == nil {
 		recycle = true
 	} else {
-		// IO streams are guaranteed to be completely drained only on daxRequestException
-		d, ok := err.(*daxRequestFailure)
-		recycle = ok
-		if ok && d.authError() {
-			t.SetAuthExpiryUnix(time.Now().Unix())
+		// IO streams are guaranteed to be completely drained on daxRequestException or on daxTransactionCanceledFailure
+		switch typedErr := err.(type) {
+		case *daxRequestFailure:
+			recycle = true
+			if typedErr.authError() {
+				t.SetAuthExpiryUnix(time.Now().Unix())
+			}
+
+		case *daxTransactionCanceledFailure:
+			recycle = true
+			if typedErr.daxRequestFailure != nil && typedErr.daxRequestFailure.authError() {
+				t.SetAuthExpiryUnix(time.Now().Unix())
+			}
 		}
+
 	}
 	if recycle {
 		client.pool.put(t)
