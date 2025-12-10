@@ -37,6 +37,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/smithy-go"
 	"github.com/aws/smithy-go/logging"
+	"github.com/aws/smithy-go/metrics"
 )
 
 type serviceEndpoint struct {
@@ -75,6 +76,8 @@ type Config struct {
 	logger                   logging.Logger
 	logLevel                 utils.LogLevelType
 
+	MeterProvider metrics.MeterProvider
+
 	RouteManagerEnabled bool // this flag temporarily removes routes facing network errors.
 	IpDiscovery         types.IpDiscovery
 }
@@ -89,18 +92,23 @@ func (cfg *Config) validate() error {
 	if cfg.HostPorts == nil || len(cfg.HostPorts) == 0 {
 		return smithy.NewErrParamRequired("Endpoint")
 	}
+
 	if len(cfg.Region) == 0 {
 		return smithy.NewErrParamRequired("config.Region")
 	}
+
 	if cfg.Credentials == nil {
 		return smithy.NewErrParamRequired("config.Credentials")
 	}
+
 	if cfg.MaxPendingConnectionsPerHost < 0 {
 		return NewCustomInvalidParamError("ConfigValidation", "MaxPendingConnectionsPerHost cannot be negative")
 	}
+
 	if !cfg.IpDiscovery.IsValid() {
 		return smithy.NewErrParamRequired("config.IpDiscovery must be 'ipv4' or 'ipv6'")
 	}
+
 	return nil
 }
 
@@ -134,7 +142,10 @@ func DefaultConfig() Config {
 		IdleConnectionReapDelay:  30 * time.Second,
 		RouteManagerEnabled:      false,
 		IpDiscovery:              "",
+
+		MeterProvider: &metrics.NopMeterProvider{},
 	}
+
 	if cfg.Credentials == nil {
 		conf, err := config.LoadDefaultConfig(context.Background())
 		if err != nil {
@@ -142,6 +153,7 @@ func DefaultConfig() Config {
 		}
 		cfg.Credentials = conf.Credentials
 	}
+
 	return cfg
 }
 
@@ -377,6 +389,8 @@ type cluster struct {
 	config        Config
 	clientBuilder clientBuilder
 	IpDiscovery   types.IpDiscovery
+
+	daxSdkMetrics *daxSdkMetrics
 }
 
 type clientAndConfig struct {
@@ -388,16 +402,39 @@ func newCluster(cfg Config) (*cluster, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
+
 	seeds, hostname, isEncrypted, err := getHostPorts(cfg.HostPorts)
 	if err != nil {
 		return nil, err
 	}
+
 	cfg.connConfig.isEncrypted = isEncrypted
 	cfg.connConfig.skipHostnameVerification = cfg.SkipHostnameVerification
 	cfg.connConfig.hostname = hostname
+	sdkMetrics, err := buildDaxSdkMetrics(cfg.MeterProvider)
+	if err != nil {
+		return nil, err
+	}
+
 	cfg.validateConnConfig()
-	routeManager := newRouteManager(cfg.RouteManagerEnabled, cfg.ClientHealthCheckInterval, cfg.logger, cfg.logLevel)
-	return &cluster{seeds: seeds, config: cfg, executor: newExecutor(), clientBuilder: &singleClientBuilder{}, routeManager: routeManager, IpDiscovery: cfg.IpDiscovery}, nil
+
+	routeManager := newRouteManager(
+		cfg.RouteManagerEnabled,
+		cfg.ClientHealthCheckInterval,
+		cfg.logger,
+		cfg.logLevel,
+		sdkMetrics,
+	)
+
+	return &cluster{
+		seeds:         seeds,
+		config:        cfg,
+		executor:      newExecutor(),
+		clientBuilder: &singleClientBuilder{},
+		routeManager:  routeManager,
+		daxSdkMetrics: sdkMetrics,
+		IpDiscovery:   cfg.IpDiscovery,
+	}, nil
 }
 
 func getHostPorts(hosts []string) (hostPorts []hostPort, hostname string, isEncrypted bool, err error) {
@@ -828,7 +865,7 @@ func (c *cluster) pullEndpoints() ([]serviceEndpoint, error) {
 
 func (c *cluster) pullEndpointsFrom(ip net.IP, port int) ([]serviceEndpoint, error) {
 	client, err := c.clientBuilder.newClient(ip, port, c.config.connConfig, c.config.Region, c.config.Credentials,
-		c.config.MaxPendingConnectionsPerHost, c.config.DialContext, nil)
+		c.config.MaxPendingConnectionsPerHost, c.config.DialContext, nil, c.daxSdkMetrics)
 	if err != nil {
 		return nil, err
 	}
@@ -877,18 +914,38 @@ func (c *cluster) getAllRoutes() []DaxAPI {
 }
 
 func (c *cluster) newSingleClient(cfg serviceEndpoint) (DaxAPI, error) {
-	return c.clientBuilder.newClient(net.IP(cfg.address), cfg.port, c.config.connConfig, c.config.Region, c.config.Credentials, c.config.MaxPendingConnectionsPerHost, c.config.DialContext, c)
+	return c.clientBuilder.newClient(net.IP(cfg.address), cfg.port, c.config.connConfig, c.config.Region, c.config.Credentials, c.config.MaxPendingConnectionsPerHost, c.config.DialContext, c, c.daxSdkMetrics)
 }
 
 type clientBuilder interface {
-	newClient(net.IP, int, connConfig, string, aws.CredentialsProvider, int, dialContext, RouteListener) (DaxAPI, error)
+	newClient(net.IP, int, connConfig, string, aws.CredentialsProvider, int, dialContext, RouteListener, *daxSdkMetrics) (DaxAPI, error)
 }
 
 type singleClientBuilder struct{}
 
-func (*singleClientBuilder) newClient(ip net.IP, port int, connConfigData connConfig, region string, credentials aws.CredentialsProvider, maxPendingConnects int, dialContextFn dialContext, routeListener RouteListener) (DaxAPI, error) {
+func (*singleClientBuilder) newClient(
+	ip net.IP,
+	port int,
+	connConfigData connConfig,
+	region string,
+	credentials aws.CredentialsProvider,
+	maxPendingConnects int,
+	dialContextFn dialContext,
+	routeListener RouteListener,
+	sdkMetrics *daxSdkMetrics,
+) (DaxAPI, error) {
 	endpoint := net.JoinHostPort(ip.String(), strconv.Itoa(port))
-	return newSingleClientWithOptions(endpoint, connConfigData, region, credentials, maxPendingConnects, dialContextFn, routeListener)
+
+	return newSingleClientWithOptions(
+		endpoint,
+		connConfigData,
+		region,
+		credentials,
+		maxPendingConnects,
+		dialContextFn,
+		routeListener,
+		sdkMetrics,
+	)
 }
 
 type taskExecutor struct {
