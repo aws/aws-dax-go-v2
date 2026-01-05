@@ -30,6 +30,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/smithy-go"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -567,4 +568,230 @@ func (m *mockConn) SetReadDeadline(t time.Time) error {
 
 func (m *mockConn) SetWriteDeadline(t time.Time) error {
 	return nil
+}
+
+// Test daxRequestFailure where authError() returns true
+// Test daxTransactionCanceledFailure where authError() returns true
+// Encapsulate both cases when the (mocked) tube session matches and don't match the pool's session,
+// as this impacts the tubepool.put method control flow, not recycleTube's
+func TestRecycleTube(t *testing.T) {
+	mockedConn := mockConn{rd: []byte{cbor.Array}}
+	tmp := &testMeterProvider{}
+	om, _ := buildDaxSdkMetrics(tmp)
+	client, clientErr := newSingleClientWithOptions(":9121", unEncryptedConnConfig, "us-west-2", &testCredentialProvider{}, 1, func(ctx context.Context, a, n string) (net.Conn, error) {
+		return &mockedConn, nil
+	}, nil, om)
+	defer client.Close()
+	if clientErr != nil {
+		t.Fatalf("unexpected error %v", clientErr)
+	}
+
+	// Create daxRequestFailure and simulate authError returning true
+	drfErr := newDaxRequestFailure([]int{1, 23, 31, 32}, "ec", "msg", "rid", 500, smithy.FaultServer)
+	// Create daxTransactionCanceledFailure error type and simulate authError returning true
+	dtcfErr := newDaxTransactionCanceledFailure([]int{1, 23, 31, 32}, "ec", "msg", "rid", 500, nil, nil, nil)
+	var sessionId int64 = 1
+	mockedTube := new(mockTube)
+	nextTube, nextTubeErr := newTube(&mockedConn, sessionId)
+	if nextTubeErr != nil {
+		t.Fatalf("unexpected error %v", nextTubeErr)
+	}
+
+	client.pool.session = sessionId
+	client.pool.closed = false
+
+	// Identical tubepool session id
+	mockedTube.On("Session", mock.Anything).Return(sessionId)
+	mockedTube.On("SetNext", mock.Anything).Return()
+	mockedTube.On("Next").Return(nextTube)
+	mockedTube.On("Close").Return(nil)
+	timeNow := time.Now().Unix()
+	mockedTube.On("SetAuthExpiryUnix", timeNow).Return()
+
+	client.recycleTube(mockedTube, drfErr)
+	mockedTube.AssertCalled(t, "SetAuthExpiryUnix", timeNow)
+	client.recycleTube(mockedTube, dtcfErr)
+	mockedTube.AssertCalled(t, "SetAuthExpiryUnix", timeNow)
+
+	// Distinct tubepool session id
+	mockedTube.ExpectedCalls = nil // Clear previous expectations
+	mockedTube.On("Session", mock.Anything).Return(sessionId + 1)
+	mockedTube.On("SetNext", mock.Anything).Return()
+	mockedTube.On("Next").Return(nextTube)
+	mockedTube.On("Close").Return(nil)
+	timeNow = time.Now().Unix()
+	mockedTube.On("SetAuthExpiryUnix", timeNow).Return()
+
+	client.recycleTube(mockedTube, drfErr)
+	mockedTube.AssertCalled(t, "SetAuthExpiryUnix", timeNow)
+	client.recycleTube(mockedTube, dtcfErr)
+	mockedTube.AssertCalled(t, "SetAuthExpiryUnix", timeNow)
+}
+
+// Nil tube and nil error passed as input to recycleTube
+func TestRecycleTube_WithNilTube(t *testing.T) {
+	tmp := &testMeterProvider{}
+	om, _ := buildDaxSdkMetrics(tmp)
+	client, clientErr := newSingleClientWithOptions(":9121", unEncryptedConnConfig, "us-west-2", &testCredentialProvider{}, 1, func(ctx context.Context, a, n string) (net.Conn, error) {
+		return &mockConn{rd: []byte{cbor.Array + 0}}, nil
+	}, nil, om)
+	defer client.Close()
+	if clientErr != nil {
+		t.Fatalf("unexpected error %v", clientErr)
+	}
+
+	client.pool.closeTubeImmediately = true
+
+	client.recycleTube(nil, nil) // Should do nothing
+}
+
+// Non-nil tube, but nil error passed as args to recycleTube
+func TestRecycleTube_WithNilError(t *testing.T) {
+	mockedConn := mockConn{rd: []byte{cbor.Array}}
+	tmp := &testMeterProvider{}
+	om, _ := buildDaxSdkMetrics(tmp)
+	client, clientErr := newSingleClientWithOptions(":9121", unEncryptedConnConfig, "us-west-2", &testCredentialProvider{}, 1, func(ctx context.Context, a, n string) (net.Conn, error) {
+		return &mockedConn, nil
+	}, nil, om)
+	defer client.Close()
+	if clientErr != nil {
+		t.Fatalf("unexpected error %v", clientErr)
+	}
+
+	var sessionId int64 = 1
+	client.pool.session = sessionId
+	client.pool.closed = false
+
+	mockedTube := new(mockTube)
+	nextTube, nextTubeErr := newTube(&mockedConn, sessionId)
+	if nextTubeErr != nil {
+		t.Fatalf("unexpected error %v", nextTubeErr)
+	}
+
+	mockedTube.On("Session", mock.Anything).Return(sessionId)
+	mockedTube.On("SetNext", mock.Anything).Return()
+	mockedTube.On("Next").Return(nextTube)
+	mockedTube.On("Close").Return(nil)
+
+	client.recycleTube(mockedTube, nil)
+	mockedTube.AssertNotCalled(t, "SetAuthExpiryUnix")
+}
+
+// Test daxRequestFailure where authError() returns false
+// Test daxTransactionCanceledFailure where authError() returns false
+func TestRecycleTube_NonAuthErrors(t *testing.T) {
+	mockedConn := mockConn{rd: []byte{cbor.Array}}
+	tmp := &testMeterProvider{}
+	om, _ := buildDaxSdkMetrics(tmp)
+	client, clientErr := newSingleClientWithOptions(":9121", unEncryptedConnConfig, "us-west-2", &testCredentialProvider{}, 1, func(ctx context.Context, a, n string) (net.Conn, error) {
+		return &mockedConn, nil
+	}, nil, om)
+	defer client.Close()
+	if clientErr != nil {
+		t.Fatalf("unexpected error %v", clientErr)
+	}
+
+	// Create daxRequestFailure and simulate authError returning false
+	drfErr := newDaxRequestFailure([]int{1, 2, 3, 4}, "ec", "msg", "rid", 500, smithy.FaultServer)
+	// Create daxTransactionCanceledFailure error type and simulate authError returning false
+	dtcfErr := newDaxTransactionCanceledFailure([]int{1, 2, 3, 4}, "ec", "msg", "rid", 500, nil, nil, nil)
+	var sessionId int64 = 1
+	mockedTube := new(mockTube)
+	nextTube, nextTubeErr := newTube(&mockedConn, sessionId)
+	if nextTubeErr != nil {
+		t.Fatalf("unexpected error %v", nextTubeErr)
+	}
+
+	client.pool.session = sessionId
+	client.pool.closed = false
+
+	// Identical tubepool session id
+	mockedTube.On("Session", mock.Anything).Return(sessionId)
+	mockedTube.On("SetNext", mock.Anything).Return()
+	mockedTube.On("Next").Return(nextTube)
+	mockedTube.On("Close").Return(nil)
+
+	client.recycleTube(mockedTube, drfErr)
+	mockedTube.AssertNotCalled(t, "SetAuthExpiryUnix")
+	client.recycleTube(mockedTube, dtcfErr)
+	mockedTube.AssertNotCalled(t, "SetAuthExpiryUnix")
+}
+
+// Test daxTransactionCanceledFailure with nil embedded daxRequestFailure
+func TestRecycleTube_NilDaxRequestFailure(t *testing.T) {
+	mockedConn := mockConn{rd: []byte{cbor.Array}}
+	tmp := &testMeterProvider{}
+	om, _ := buildDaxSdkMetrics(tmp)
+	client, clientErr := newSingleClientWithOptions(":9121", unEncryptedConnConfig, "us-west-2", &testCredentialProvider{}, 1, func(ctx context.Context, a, n string) (net.Conn, error) {
+		return &mockedConn, nil
+	}, nil, om)
+	defer client.Close()
+	if clientErr != nil {
+		t.Fatalf("unexpected error %v", clientErr)
+	}
+
+	// Create daxTransactionCanceledFailure error type without setting values for any field
+	dtcfErr := &daxTransactionCanceledFailure{
+		daxRequestFailure:       nil,
+		cancellationReasonCodes: nil,
+		cancellationReasonMsgs:  nil,
+		cancellationReasonItems: nil,
+	}
+	if dtcfErr.daxRequestFailure != nil {
+		t.Fatal("daxRequestFailure is not nil")
+	}
+
+	var sessionId int64 = 1
+	mockedTube := new(mockTube)
+	nextTube, nextTubeErr := newTube(&mockedConn, sessionId)
+	if nextTubeErr != nil {
+		t.Fatalf("unexpected error %v", nextTubeErr)
+	}
+
+	client.pool.session = sessionId
+	client.pool.closed = false
+
+	// Identical tubepool session id
+	mockedTube.On("Session", mock.Anything).Return(sessionId)
+	mockedTube.On("SetNext", mock.Anything).Return()
+	mockedTube.On("Next").Return(nextTube)
+	mockedTube.On("Close").Return(nil)
+
+	client.recycleTube(mockedTube, dtcfErr)
+	mockedTube.AssertNotCalled(t, "SetAuthExpiryUnix")
+}
+
+func TestRecycleTube_NonDaxErrors(t *testing.T) {
+	// Test with regular errors that don't match the switch cases
+	mockedConn := mockConn{rd: []byte{cbor.Array}}
+	tmp := &testMeterProvider{}
+	om, _ := buildDaxSdkMetrics(tmp)
+	client, clientErr := newSingleClientWithOptions(":9121", unEncryptedConnConfig, "us-west-2", &testCredentialProvider{}, 1, func(ctx context.Context, a, n string) (net.Conn, error) {
+		return &mockedConn, nil
+	}, nil, om)
+	defer client.Close()
+	if clientErr != nil {
+		t.Fatalf("unexpected error %v", clientErr)
+	}
+
+	// Create daxTransactionCanceledFailure error type without setting values for any field
+	err := new(error)
+	var sessionId int64 = 1
+	mockedTube := new(mockTube)
+	nextTube, nextTubeErr := newTube(&mockedConn, sessionId)
+	if nextTubeErr != nil {
+		t.Fatalf("unexpected error %v", nextTubeErr)
+	}
+
+	client.pool.session = sessionId
+	client.pool.closed = false
+
+	// Identical tubepool session id
+	mockedTube.On("Session", mock.Anything).Return(sessionId)
+	mockedTube.On("SetNext", mock.Anything).Return()
+	mockedTube.On("Next").Return(nextTube)
+	mockedTube.On("Close").Return(nil)
+
+	client.recycleTube(mockedTube, *err)
+	mockedTube.AssertNotCalled(t, "SetAuthExpiryUnix")
 }

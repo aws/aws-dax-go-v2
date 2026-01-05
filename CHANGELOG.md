@@ -1,3 +1,7 @@
+Release v1.0.3 (2026-01-05)
+===
+* Added support for handling daxTransactionCanceledFailure error during connection recycling
+
 Release v1.0.2 (2025-12-10)
 ===
 * Added comprehensive metrics tracking for operations, connections, and route management
