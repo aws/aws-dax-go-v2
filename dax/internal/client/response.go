@@ -1184,7 +1184,7 @@ func decodeAttributeProjection(ctx context.Context, reader *cbor.Reader, attrLis
 		attrs[ans[ord]] = av
 		return nil
 	})
-	return attrs, nil
+	return attrs, err
 }
 
 func decodeConsumedCapacity(reader *cbor.Reader) (*types.ConsumedCapacity, error) {
